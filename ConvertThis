@@ -1,0 +1,555 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Data;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web.UI.WebControls;
+
+
+namespace Conversion
+{
+    public static class ConvertThis
+    {
+        #region GetText
+        private static readonly string[] TEXT_PROPERTIES = new string[] { "SelectedItem", "SelectedValue", "Text", "InnerText", "Value", "Alt", "AlternateText" }; // Reflection to see if the object has these properties. If it does then the value is returned.
+
+        public static string GetText(this object obj, string propertyName = null, string seperator = null)
+        {
+            string returnValue = null;
+            if (obj != null && obj != DBNull.Value)
+            {
+                if (obj.GetType() == typeof(string)) { returnValue = (string)obj; }
+                else
+                {
+                    bool found = !String.IsNullOrWhiteSpace(propertyName) && obj.HasProperty(propertyName);
+                    if (found) { returnValue = obj.GetPropertyValue(propertyName).GetText(); }
+
+                    for (int i = 0; i < TEXT_PROPERTIES.Length && !found; i++)
+                    {
+                        found |= obj.HasProperty(TEXT_PROPERTIES[i]);
+                        if (found) { returnValue = obj.GetPropertyValue(TEXT_PROPERTIES[i]).GetText(propertyName); }
+                    }
+                    if (!found)
+                    {
+                        if (obj is NameValueCollection && !String.IsNullOrWhiteSpace(propertyName)) { returnValue = ((NameValueCollection)obj).ValueOf(propertyName); }
+                        else if (obj is DataRow) // GetText should not be called for a DataRow. Use Column instead.
+                        {
+                            if (!String.IsNullOrWhiteSpace(propertyName)) { returnValue = ((DataRow)obj).Column<string>(propertyName); }
+                            else { returnValue = GetTextFromDataRow(obj); }
+                        }
+                        else if (obj is DataTable) { returnValue = Concatenate("\r\n", propertyName, false, ((DataTable)obj).AsEnumerable().ToArray()); }
+                        else if (obj is DataSet) { returnValue = Concatenate("\r\n\r\n", propertyName, false, ((DataSet)obj).Tables.Cast<DataTable>().ToArray()); }
+                        else if (obj is IEnumerable && obj.GetType() != typeof(string)) { returnValue = Concatenate(seperator, propertyName, false, ((IEnumerable)obj).Cast<object>().ToArray()); }
+                        else { returnValue = Convert.ToString(obj); }
+                    }
+                }
+            }
+            return returnValue ?? String.Empty;
+        }
+        private static string GetTextFromDataRow(object obj)
+        {
+            string returnValue = String.Empty;
+            if (obj != null && obj != DBNull.Value)
+            {
+                DataRow dr = obj as DataRow;
+                if (dr != null)
+                {
+                    object[] objs = dr.Table.Columns.Cast<DataColumn>().Select(c => dr.Column(c.ColumnName)).ToArray();
+                    returnValue = Concatenate(",", true, objs);
+                }
+            }
+
+            return returnValue;
+        }
+
+        #region Reflection
+        public static bool HasProperty(this object obj, string propertyName)
+        {
+            return (obj.GetType()).GetProperty(propertyName) != null;
+        }
+        public static object GetPropertyValue(this object obj, string propertyName, params object[] index)
+        {
+            object returnValue = null;
+
+            PropertyInfo property = (obj.GetType()).GetProperty(propertyName);
+            if (property != null && property.CanRead) { returnValue = property.GetValue(obj, index); }
+
+            return returnValue;
+        }
+        public static bool SetPropertyValues(object obj, NameValueCollection fc, bool allowPartialMatch = true)
+        {
+            bool returnValue = fc != null && fc.Count > 0 && obj != null;
+            if (returnValue)
+            {
+                PropertyInfo[] properties = obj.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                if (properties != null && properties.Length > 0)
+                {
+                    List<string> propertyNames = properties.Select(p => p.Name).OrderBy(n => n).ToList();
+                    List<string> strippedPropertyNames = propertyNames.Select(n => StripNonAlphaNumeric(n).ToUpper()).ToList();
+
+                    foreach (string key in fc)
+                    {
+                        if (propertyNames.Contains(key)) { returnValue &= obj.SetPropertyValue(key, fc[key]); }
+                        else if (allowPartialMatch)
+                        {
+                            int i = strippedPropertyNames.IndexOf(StripNonAlphaNumeric(key).ToUpper());
+                            if (i >= 0) { returnValue &= obj.SetPropertyValue(propertyNames[i], fc[key]); }
+                        }
+                    }
+                }
+            }
+            return returnValue;
+        }
+        public static bool SetPropertyValue(this object obj, string propertyName, object propertyValue, params object[] index)
+        {
+            bool returnValue = false;
+
+            PropertyInfo prop = obj.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
+            if (prop != null && prop.CanWrite)
+            {
+                MethodInfo method = typeof(Convert).GetMethod("TryCast", new Type[] { typeof(object) });
+                if (method != null)
+                {
+                    method = method.MakeGenericMethod(prop.PropertyType);
+                    object newValue = method.Invoke(obj, new object[] { propertyValue });
+                    prop.SetValue(obj, newValue, index);
+                    returnValue = true;
+                }
+                else
+                {
+                    try
+                    {
+                        prop.SetValue(obj, propertyValue, index);
+                        returnValue = true;
+                    }
+                    catch
+                    {
+                        returnValue = false;
+                        throw;
+                    }
+                }
+            }
+            return returnValue;
+        }
+        #endregion
+        #endregion
+
+        #region Convert
+        // ToInt(), ToBool(), etc. is more reliable than TryCast().
+        // For Example 1.5.ToInt() would return 2 (1.5 rounded away from zero).
+        // TryCast<int>(1.5) would return 0 (default int) as TryCast cannot cast decimal to int.
+
+        // Another example:
+        /*
+         * CheckBox cb = new CheckBox;
+         * cb.Checked = true;
+         * 
+         * cb.ToBool() returns true (cb is checked).
+         * TryCast<bool>(cb) returns false (default bool) a checkbox cannot be cast as a bool.
+         * */
+        #region TryCast
+        #region TryCast Main
+        public static T TryCast<T>(object obj)
+        {
+            return TryCast<T>(obj, default(T));
+        }
+        public static T TryCast<T>(object obj, T defaultValue)
+        {
+            T returnValue = defaultValue;
+            if (obj != null && obj != DBNull.Value)
+            {
+                try
+                {
+                    if (obj.GetType() == typeof(T)) { returnValue = (T)obj; }
+                    else if (typeof(T) == typeof(object)) { returnValue = (T)obj; } // object doesn't cast properly.
+                    else
+                    {
+                        TypeConverter converter = TypeDescriptor.GetConverter(typeof(T));
+                        if (converter != null && converter.CanConvertFrom(obj.GetType()) && converter.IsValid(obj))
+                        {
+                            returnValue = (T)converter.ConvertFrom(obj);
+                        }
+                        else { returnValue = TryCast<T>(obj.GetText(), defaultValue); }
+                    }
+                }
+                catch { returnValue = TryCast<T>(obj.GetText(), defaultValue); }
+            }
+            return returnValue;
+        }
+        public static T TryCast<T>(string text, T defaultValue = default(T))
+        {
+            T returnValue = defaultValue;
+            if (!String.IsNullOrWhiteSpace(text))
+            {
+                try
+                {
+                    if (typeof(T) == typeof(object)) { returnValue = (T)(object)text; } // object doesn't cast properly.
+                    else
+                    {
+                        TypeConverter converter = TypeDescriptor.GetConverter(typeof(T));
+                        if (converter != null)
+                        {
+                            if (converter.IsValid(text)) { returnValue = (T)converter.ConvertFromString(text); }
+                            else
+                            {
+                                text = TrimNonAlphaNumeric(text);
+                                if (!String.IsNullOrWhiteSpace(text) && converter.IsValid(text)) { returnValue = (T)converter.ConvertFromString(text); }
+                            }
+                        }
+                    }
+                }
+                catch { returnValue = defaultValue; }
+            }
+            return returnValue;
+        }
+        #endregion
+
+        #region NameValueCollection
+        public static string ValueOf(this NameValueCollection collection, string key)
+        {
+            return ValueOf<string>(collection, key, String.Empty);
+        }
+        public static T ValueOf<T>(this NameValueCollection collection, string key, T defaultValue = default(T))
+        {
+            T returnValue = defaultValue;
+            if (collection != null && !String.IsNullOrWhiteSpace(key))
+            {
+                returnValue = TryCast<T>(collection[key], defaultValue);
+            }
+            return returnValue;
+        }
+        #endregion
+
+        #region DataRow Column
+        public static object Column(this DataRow dr, string columnName)
+        {
+            return Column<object>(dr, columnName, DBNull.Value);
+        }
+        public static T Column<T>(this DataRow dr, string columnName, T defaultValue = default(T))
+        {
+            T returnValue = defaultValue;
+            if (dr != null && !String.IsNullOrWhiteSpace(columnName))
+            {
+                if (dr.Table.Columns.Contains(columnName)) { returnValue = TryCast(dr[columnName], defaultValue); }
+                else { /*ThrowException(new ArgumentOutOfRangeException("columnName", columnName, "DataRow does not contain this column."), true, true);*/ }
+            }
+            else
+            {
+                if (dr == null) { throw new ArgumentNullException("dr", "Data row is null"); }
+                else { throw new ArgumentNullException("columnName", "Column name cannot be null ir empty."); }
+            }
+            return returnValue;
+        }
+        #endregion
+
+        #region Coalesce
+        public static string Coalesce(params object[] objs)
+        {
+            return objs.Select(o => o.GetText()).Where(s => !String.IsNullOrWhiteSpace(s.Trim())).FirstOrDefault() ?? String.Empty;
+        }
+        public static T Coalesce<T>(params object[] objs) where T : struct
+        {
+            return Coalesce<T>(o => TryCast<T?>(o, null), objs);
+        }
+        public static T Coalesce<T>(Func<object, T?> convert, params object[] objs) where T : struct
+        {
+            return objs.Select(o => convert(o)).Where(t => t != null).Select(t => (T)t).FirstOrDefault();
+        }
+        public static T Coalesce<T>(Func<T, bool> exists, params T[] objs)
+        {
+            return objs.Where(o => o != null && exists(o)).FirstOrDefault();
+        }
+        #endregion
+
+        #endregion
+
+        #region Int types
+        public static int ToInt(this object obj, int defaultValue = default(int), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullInt(rounding) ?? defaultValue;
+        }
+        public static int? ToNullInt(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<int>(obj, int.TryParse, rounding);
+        }
+        public static uint ToUnsignedInt(this object obj, uint defaultValue = default(uint), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullUnsignedInt(rounding) ?? defaultValue;
+        }
+        public static uint? ToNullUnsignedInt(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<uint>(obj, uint.TryParse, rounding);
+        }
+        public static long ToLong(this object obj, long defaultValue = default(long), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullLong(rounding) ?? defaultValue;
+        }
+        public static long? ToNullLong(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<long>(obj, long.TryParse, rounding);
+        }
+        public static short ToShort(this object obj, short defaultValue = default(short), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullShort(rounding) ?? defaultValue;
+        }
+        public static short? ToNullShort(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<short>(obj, short.TryParse, rounding);
+        }
+        public static ushort ToUnsignedShort(this object obj, ushort defaultValue = default(ushort), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullUnsignedShort(rounding) ?? defaultValue;
+        }
+        public static ushort? ToNullUnsignedShort(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<ushort>(obj, ushort.TryParse, rounding);
+        }
+        public static byte ToByte(this object obj, byte defaultValue = default(byte), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullByte(rounding) ?? defaultValue;
+        }
+        public static byte? ToNullByte(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<byte>(obj, byte.TryParse, rounding);
+        }
+        public static sbyte ToSignedByte(this object obj, sbyte defaultValue = default(sbyte), Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return obj.ToNullSignedByte(rounding) ?? defaultValue;
+        }
+        public static sbyte? ToNullSignedByte(this object obj, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            return TryNullParseInt<sbyte>(obj, sbyte.TryParse, rounding);
+        }
+        #endregion
+
+        #region Decimal types
+        public static decimal ToDecimal(this object obj, decimal defaultValue = default(decimal))
+        {
+            return obj.ToNullDecimal() ?? defaultValue;
+        }
+        public static decimal? ToNullDecimal(this object obj)
+        {
+            return TryNullParse<decimal>(obj, decimal.TryParse);
+        }
+        public static double ToDouble(this object obj, double defaultValue = default(double))
+        {
+            return obj.ToNullDouble() ?? defaultValue;
+        }
+        public static double? ToNullDouble(this object obj)
+        {
+            return TryNullParse<double>(obj, double.TryParse);
+        }
+        public static float ToFloat(this object obj, float defaultValue = default(float))
+        {
+            return obj.ToNullFloat() ?? defaultValue;
+        }
+        public static float? ToNullFloat(this object obj)
+        {
+            return TryNullParse<float>(obj, float.TryParse);
+        }
+        #endregion
+
+        #region Other types
+        public static bool ToBool(this object obj, bool defaultValue = default(bool))
+        {
+            return obj.ToNullBool() ?? defaultValue;
+        }
+        public static bool? ToNullBool(this object obj)
+        {
+            bool? returnValue = TryNullParse<bool>(obj, bool.TryParse);
+            if (returnValue == null && obj != null && obj != DBNull.Value)
+            {
+                if (obj.HasProperty("Checked")) { returnValue = obj.GetPropertyValue("Checked").ToNullBool(); }
+                else if (obj.HasProperty("Selected")) { returnValue = obj.GetPropertyValue("Selected").ToNullBool(); }
+                else
+                {
+                    string text = StripNonAlphaNumeric(obj.GetText());
+                    if (!String.IsNullOrWhiteSpace(text))
+                    {
+                        switch (text.ToUpper())
+                        {
+                            case "1":
+                            case "TRUE": returnValue = true;
+                                break;
+                            case "0":
+                            case "FALSE": returnValue = false;
+                                break;
+                        }
+                    }
+                }
+            }
+            return returnValue;
+        }
+        public static DateTime ToDateTime(this object obj, DateTime defaultValue = default(DateTime))
+        {
+            return obj.ToNullDateTime() ?? defaultValue;
+        }
+        public static DateTime? ToNullDateTime(this object obj)
+        {
+            return TryNullParse<DateTime>(obj, DateTime.TryParse);
+        }
+        public static char ToChar(this object obj, char defaultValue = default(char))
+        {
+            return obj.ToNullChar() ?? defaultValue;
+        }
+        public static char? ToNullChar(this object obj)
+        {
+            char? returnValue = TryNullParse<char>(obj, char.TryParse);
+            if (returnValue == null)
+            {
+                string text = obj.GetText();
+                if (!String.IsNullOrEmpty(text) && text.Length > 0) { returnValue = text[0]; }
+            }
+            return returnValue;
+        }
+        public static string ToSafeString(this object obj, string defaultValue = null)
+        {
+            string returnValue = defaultValue ?? String.Empty;
+            if (obj != null && obj != DBNull.Value) { returnValue = obj.ToString(); }
+            return returnValue;
+        }
+        #endregion
+
+        #region TryNullParse
+        public delegate bool TryParse<T>(string input, out T output);
+        private static Nullable<T> TryNullParse<T>(object obj, TryParse<T> tryParse) where T : struct
+        {
+            T? returnValue = null;
+            String text = obj.GetText("Value");
+            if (!String.IsNullOrWhiteSpace(text))
+            {
+                T tempValue;
+                if (tryParse(text, out tempValue)) { returnValue = tempValue; }
+                else if (tryParse(TrimNonAlphaNumeric(text), out tempValue)) { returnValue = tempValue; }
+            }
+            return returnValue;
+        }
+        private static Nullable<T> TryNullParseInt<T>(object obj, TryParse<T> tryParse, Rounding rounding = DEFAULT_ROUNDING) where T : struct
+        {
+            T? returnValue = TryNullParse<T>(obj, tryParse);
+            if (returnValue == null)
+            {
+                decimal? dec = obj.ToNullDecimal();
+                if (dec != null) { returnValue = TryNullParse<T>(dec.Round(0, rounding), tryParse); }
+            }
+            return returnValue;
+        }
+        #endregion
+
+        #endregion
+
+        #region Rounding
+        public const Rounding DEFAULT_ROUNDING = Rounding.AwayFromZero; // Default rounding is "AwayFromZero". This is different to C# normal default which is ToEven.
+        public static string Round(this object obj, int dp = 2, Rounding rounding = DEFAULT_ROUNDING)
+        {
+            string returnValue = String.Empty;
+
+            decimal? dec = obj.ToNullDecimal();
+            if (dec != null)
+            {
+                decimal amount = RoundDec((decimal)dec, dp, rounding);
+                StringBuilder formatString = new StringBuilder();
+                for (int i = 0; i < dp; i++)
+                {
+                    if (formatString.Length < 1) { formatString.Append("0."); }
+                    formatString.Append("0");
+                }
+                returnValue = amount.ToString(formatString.ToString());
+            }
+            return returnValue;
+        }
+        private static decimal RoundDec(decimal dec, int dp, Rounding rounding)
+        {
+            int multiplier = TenToThePower(dp);
+            switch (rounding)
+            {
+                case Rounding.AwayFromZero: dec = Math.Round(dec, dp, MidpointRounding.AwayFromZero);
+                    break;
+                case Rounding.ToEven: dec = Math.Round(dec, dp, MidpointRounding.ToEven);
+                    break;
+                case Rounding.Up: dec = ((decimal)Math.Ceiling(dec * multiplier)) / multiplier;
+                    break;
+                case Rounding.Down: dec = ((decimal)Math.Floor(dec * multiplier)) / multiplier;
+                    break;
+            }
+            return dec;
+        }
+        private static int TenToThePower(int dp)
+        {
+            int returnValue = 1;
+            for (int i = 0; i < dp; i++) { returnValue *= 10; }
+            return returnValue;
+        }
+        #endregion
+
+        #region Useful
+        #region Strip Text
+        public static string StripNonAlphaNumeric(string text, bool allowDecimal = false)
+        {
+            if (!String.IsNullOrWhiteSpace(text))
+            {
+                text = text.Replace("&middot;", ".").Replace("\u00B7", "."); // Replaces interpuncts with full-stops. Convervsion to decimal only works when full-stop is used as the interpunct.
+                Regex nonAlphaNumeric = new Regex(String.Format(@"[^a-zA-Z0-9{0}]", allowDecimal ? @"\." : String.Empty));
+                text = nonAlphaNumeric.Replace(text, String.Empty);
+                return text;
+            }
+            else { return String.Empty; }
+
+        }
+        public static string TrimNonAlphaNumeric(string text)
+        {
+            if (!String.IsNullOrEmpty(text))
+            {
+                Regex start = new Regex(@"^[^a-zA-Z0-9]");
+                Regex end = new Regex(@"[^a-zA-Z0-9]$");
+                text = start.Replace(text, String.Empty);
+                text = end.Replace(text, String.Empty);
+                return text;
+            }
+            else { return String.Empty; }
+        }
+        #endregion
+
+        #region Concatenate
+        public static string Concatenate(string seperator, params object[] objs)
+        {
+            return Concatenate(seperator, false, objs);
+        }
+        public static string Concatenate(string seperator, bool includeEmptyEntries, params object[] objs)
+        {
+            return Concatenate(seperator, null, includeEmptyEntries, objs);
+        }
+        public static string Concatenate(string seperator, string propertyName, bool includeEmptyEntries, params object[] objs)
+        {
+            StringBuilder sb = new StringBuilder();
+            if (objs != null)
+            {
+                seperator = seperator ?? ",";
+                foreach (object obj in objs)
+                {
+                    string text = obj.GetText(propertyName, seperator);
+                    if (!String.IsNullOrWhiteSpace(text) || includeEmptyEntries)
+                    {
+                        if (sb.Length > 0) { sb.Append(seperator); }
+                        sb.Append(text);
+                    }
+                }
+            }
+            return sb.ToString();
+        }
+        #endregion
+        #endregion
+    }
+    public enum Rounding { AwayFromZero, ToEven, Up, Down };
+    /*
+     * AwayFromZero - When a number is halfway between two others, it is rounded toward the nearest number that is away from zero. (Like the rounding taught at school.)
+     * ToEven - When a number is halfway between two others, it is rounded toward the nearest even number. (Have been told bankers used this.)
+     * Up - Rounds to the highest number.
+     * Down - Rounds to the lowest number.
+    */
+}
