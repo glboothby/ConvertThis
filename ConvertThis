@@ -167,6 +167,7 @@ namespace Conversion
                 {
                     if (obj.GetType() == typeof(T)) { returnValue = (T)obj; }
                     else if (typeof(T) == typeof(object)) { returnValue = (T)obj; } // object doesn't cast properly.
+                    else if (typeof(T) == typeof(string)) { returnValue = (T)(object)(obj.GetText()); }
                     else
                     {
                         TypeConverter converter = TypeDescriptor.GetConverter(typeof(T));
